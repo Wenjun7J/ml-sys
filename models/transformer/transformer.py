@@ -22,7 +22,18 @@ class ModelArgs:
     vocab_size: int
     block_size: int
     n_layer: int
+'''
+shape is like [B, Tq, n_embd], consider [Tq, n_embd] below:  
+q:                       k:                        v:
+[q11, q12, q13, q14]      [k11, k12, k13, k14]      [v11, v12, v13, v14]  
+[q21, q22, q22, q24]      [k21, k22, k22, k24]      [v21, v22, v22, v24]
+[pad, pad, pad, pad]      [pad, pad, pad, pad]      [pad, pad, pad, pad]
 
+cos_similarity = qk^T
+[c11, c12, c13(pad)]
+[c21, c22, c33(pad)]
+[pad, pad, pad]
+'''
 class Attention(nn.Module):
 
     def __init__(self, args: ModelArgs, casual = False):
@@ -30,15 +41,26 @@ class Attention(nn.Module):
         self.head_dim = args.n_embd // args.n_heads
         self.casual = casual
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pad_mask: torch.Tensor,
+    ):
         scale_factor = 1 / math.sqrt(q.size(-1))
         scaled_dot = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
+
         h, w = scaled_dot.size(-2), scaled_dot.size(-1)
-        mask = torch.zeros(h, w, dtype=scaled_dot.dtype, device=scaled_dot.device)
         if self.casual:
-            temp_mask = torch.ones(h, w, dtype=torch.bool, device=scaled_dot.device).tril(diagonal=0)
-            mask.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        scores = torch.softmax(scaled_dot + mask, dim=-1)
+            causal_mask = torch.ones(h, w, dtype=torch.bool, device=scaled_dot.device).triu(diagonal=1)
+            scaled_dot = scaled_dot.masked_fill(causal_mask, float("-inf"))
+
+        if k_pad_mask is not None:
+            k_pad_mask = k_pad_mask.to(device=scaled_dot.device, dtype=torch.bool)
+            scaled_dot = scaled_dot.masked_fill(k_pad_mask[:, None, :], float("-inf"))
+
+        scores = torch.softmax(scaled_dot, dim=-1)
         return torch.matmul(scores, v)
 
 class MultiHeadAttention(nn.Module):
@@ -58,14 +80,25 @@ class MultiHeadAttention(nn.Module):
             self.wv.append(nn.Linear(args.n_embd, self.head_dim, bias=False))
         self.wo = nn.Linear(self.n_heads * self.head_dim, args.n_embd, bias=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pad_mask: torch.Tensor,
+    ):
         head_out = []
         for i in range(self.n_heads):
             q_i = self.wq[i](q)   # (B, Tq, head_dim)
             k_i = self.wk[i](k)
             v_i = self.wv[i](v)
 
-            attention_i = self.attention.forward(q_i, k_i, v_i)
+            attention_i = self.attention.forward(
+                q_i,
+                k_i,
+                v_i,
+                k_pad_mask,
+            )
             head_out.append(attention_i)
         
         head_concat = torch.cat(head_out, dim=-1)
@@ -102,8 +135,8 @@ class EncoderLayer(nn.Module):
         self.fnn_norm = LayerNorm(args.n_embd)
         self.feed_forward = MLP(args.n_embd, args.n_embd, args.dropout)
 
-    def forward(self, x):
-        h = self.attention_norm(x + self.attention.forward(x, x, x))
+    def forward(self, x, k_pad_mask: torch.Tensor):
+        h = self.attention_norm(x + self.attention.forward(x, x, x, k_pad_mask))
         out = self.fnn_norm(h + self.feed_forward.forward(h))
         return out
 
@@ -112,9 +145,9 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__() 
         self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
 
-    def forward(self, x):
+    def forward(self, x, k_pad_mask: torch.Tensor):
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, k_pad_mask)
         return x
     
 class DecoderLayer(nn.Module):
@@ -127,10 +160,22 @@ class DecoderLayer(nn.Module):
         self.ffn_norm = LayerNorm(args.n_embd)
         self.feed_forward = MLP(args.n_embd, args.n_embd, args.dropout)
 
-    def forward(self, x, encoder_out):
-        h1 = self.attention_norm_1(x + self.mask_attention.forward(x, x, x))
-        h2 = self.attention_norm_2(h1 + self.attention.forward(h1, encoder_out, encoder_out))
-        out = self.ffn_norm(h2 + self.feed_forward.forward(h2))
+    def forward(
+        self,
+        x,
+        encoder_out,
+        self_k_pad_mask: torch.Tensor = None,
+        cross_k_pad_mask: torch.Tensor = None,
+    ):
+        h1 = self.attention_norm_1(
+            x + self.mask_attention.forward(x, x, x, self_k_pad_mask)
+        )
+        h2 = self.attention_norm_2(
+            h1 + self.attention.forward(h1, encoder_out, encoder_out, cross_k_pad_mask)
+        )
+        out = self.ffn_norm(
+            h2 + self.feed_forward.forward(h2)
+        )
         return out
 
 class Decoder(nn.Module):
@@ -139,10 +184,21 @@ class Decoder(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
         self.norm = LayerNorm(args.n_embd)
 
-    def forward(self, x, enc_out):
+    def forward(
+        self,
+        x,
+        enc_out,
+        self_k_pad_mask: torch.Tensor,
+        cross_k_pad_mask: torch.Tensor,
+    ):
         "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
-            x = layer(x, enc_out)
+            x = layer(
+                x,
+                enc_out,
+                self_k_pad_mask,
+                cross_k_pad_mask,
+            )
         return self.norm(x)
 
 class PositionalEncoding(nn.Module):
@@ -195,7 +251,15 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, encoder_idx, decoder_idx, targets=None, debug=False):
+    def forward(
+        self,
+        encoder_idx,
+        decoder_idx,
+        targets=None,
+        debug=False,
+        encoder_k_pad_mask: torch.Tensor=None,
+        decoder_k_pad_mask: torch.Tensor=None,
+    ):
         _, src_t = encoder_idx.size()
         _, tgt_t = decoder_idx.size()
         assert src_t <= self.args.block_size, f"encoder length is {src_t}, max is {self.args.block_size}"
@@ -208,14 +272,19 @@ class Transformer(nn.Module):
         enc_tok_emb = self.transformer.wte(encoder_idx)
         enc_pos_emb = self.transformer.wpe(enc_tok_emb)
         enc_x = self.transformer.drop(enc_pos_emb)
-        enc_out = self.transformer.encoder(enc_x)
+        enc_out = self.transformer.encoder(enc_x, encoder_k_pad_mask)
         if debug:
             print("enc_out:", enc_out.size())
 
         dec_tok_emb = self.transformer.wte(decoder_idx)
         dec_pos_emb = self.transformer.wpe(dec_tok_emb)
         dec_x = self.transformer.drop(dec_pos_emb)
-        dec_x = self.transformer.decoder(dec_x, enc_out)
+        dec_x = self.transformer.decoder(
+            dec_x,
+            enc_out,
+            decoder_k_pad_mask,
+            encoder_k_pad_mask,
+        )
         if debug:
             print("dec_x:", dec_x.size())
 
@@ -244,7 +313,7 @@ def _tokenize_translation_batch(tokenizer, src_texts, tgt_texts, max_length):
         truncation=True,
         padding="max_length",
     )
-    return src_encoded["input_ids"], tgt_encoded["input_ids"]
+    return src_encoded.input_ids, tgt_encoded.input_ids
 
 
 def build_translation_seq2seq_dataset(
@@ -414,12 +483,26 @@ def load_checkpoint(path, device):
 
 
 @torch.no_grad()
-def generate_greedy(model, encoder_idx, decoder_idx, max_new_tokens, eos_token_id=None):
+def generate_greedy(
+    model,
+    encoder_idx,
+    decoder_idx,
+    max_new_tokens,
+    eos_token_id=None,
+    encoder_k_pad_mask=None,
+):
     model.eval()
     for _ in range(max_new_tokens):
         encoder_cond = encoder_idx[:, -model.args.block_size:]
         decoder_cond = decoder_idx[:, -model.args.block_size:]
-        logits, _ = model(encoder_cond, decoder_cond)
+        encoder_mask_cond = None
+        if encoder_k_pad_mask is not None:
+            encoder_mask_cond = encoder_k_pad_mask[:, -model.args.block_size:]
+        logits, _ = model(
+            encoder_cond,
+            decoder_cond,
+            encoder_k_pad_mask=encoder_mask_cond,
+        )
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         decoder_idx = torch.cat([decoder_idx, next_token], dim=1)
         if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
@@ -493,6 +576,7 @@ def run_train(cli_args):
         tokenizer_name = resume_ckpt.get("tokenizer_name", tokenizer_name)
         print(f"resuming from checkpoint: {cli_args.resume_from_checkpoint}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     if resume_ckpt is not None and "model_args" in resume_ckpt:
         model_args = ModelArgs(**resume_ckpt["model_args"])
     else:
@@ -610,7 +694,15 @@ def run_train(cli_args):
                         batch_encoder_inputs = batch_encoder_inputs.to(device)
                         batch_decoder_inputs = batch_decoder_inputs.to(device)
                         batch_targets = batch_targets.to(device)
-                        _, loss = model(batch_encoder_inputs, batch_decoder_inputs, batch_targets)
+                        batch_encoder_k_pad_mask = batch_encoder_inputs.eq(pad_token_id)
+                        batch_decoder_k_pad_mask = batch_decoder_inputs.eq(pad_token_id)
+                        _, loss = model(
+                            batch_encoder_inputs,
+                            batch_decoder_inputs,
+                            batch_targets,
+                            encoder_k_pad_mask=batch_encoder_k_pad_mask,
+                            decoder_k_pad_mask=batch_decoder_k_pad_mask,
+                        )
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -674,13 +766,15 @@ def run_train(cli_args):
 def run_infer(cli_args):
     device = torch.device(cli_args.device)
     model, tokenizer = load_checkpoint(cli_args.checkpoint, device)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     encoder_idx = tokenizer(
         cli_args.text,
         return_tensors="pt",
         max_length=model.args.block_size,
         truncation=True,
         padding="max_length",
-    )["input_ids"].to(device)
+    ).input_ids.to(device)
+    encoder_k_pad_mask = encoder_idx.eq(pad_token_id)
     bos_token_id = tokenizer.bos_token_id
     if bos_token_id is None:
         bos_token_id = tokenizer.cls_token_id
@@ -697,6 +791,7 @@ def run_infer(cli_args):
         decoder_start,
         cli_args.max_new_tokens,
         eos_token_id=tokenizer.sep_token_id,
+        encoder_k_pad_mask=encoder_k_pad_mask,
     )
     print(tokenizer.decode(generated_decoder[0, 1:], skip_special_tokens=True))
 
