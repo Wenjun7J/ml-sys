@@ -431,6 +431,12 @@ def parse_cli_args():
     parser = argparse.ArgumentParser(description="Train and run a tiny Transformer demo.")
     parser.add_argument("--mode", choices=["train", "infer"], default="train")
     parser.add_argument("--checkpoint", type=str, default="transformer.pt")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Resume training from a saved checkpoint path",
+    )
     parser.add_argument("--tokenizer_name", type=str, default="bert-base-multilingual-cased")
     parser.add_argument("--hf_dataset_name", type=str, default="wmt/wmt18")
     parser.add_argument("--hf_dataset_config", type=str, default="zh-en")
@@ -480,16 +486,35 @@ def parse_cli_args():
 
 def run_train(cli_args):
     device = torch.device(cli_args.device)
+    resume_ckpt = None
     tokenizer_name = cli_args.tokenizer_name
+    if cli_args.resume_from_checkpoint is not None:
+        resume_ckpt = torch.load(cli_args.resume_from_checkpoint, map_location=device)
+        tokenizer_name = resume_ckpt.get("tokenizer_name", tokenizer_name)
+        print(f"resuming from checkpoint: {cli_args.resume_from_checkpoint}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    model_args = ModelArgs(
-        n_embd=512,
-        n_heads=8,
-        dropout=0.1,
-        vocab_size=tokenizer.vocab_size,
-        block_size=cli_args.block_size,
-        n_layer=6,
-    )
+    if resume_ckpt is not None and "model_args" in resume_ckpt:
+        model_args = ModelArgs(**resume_ckpt["model_args"])
+    else:
+        model_args = ModelArgs(
+            n_embd=512,
+            n_heads=8,
+            dropout=0.1,
+            vocab_size=tokenizer.vocab_size,
+            block_size=cli_args.block_size,
+            n_layer=6,
+        )
+    if model_args.vocab_size != tokenizer.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_args.vocab_size})."
+        )
+    if model_args.block_size != cli_args.block_size:
+        print(
+            f"using block_size from model/checkpoint: {model_args.block_size} "
+            f"(ignoring cli --block_size={cli_args.block_size})",
+            flush=True,
+        )
+    train_block_size = model_args.block_size
     model = Transformer(model_args).to(device)
     chunk_lines = max(1, cli_args.chunk_lines)
     max_samples = None if cli_args.max_samples == 0 else max(1, cli_args.max_samples)
@@ -497,12 +522,19 @@ def run_train(cli_args):
     tokenize_workers = max(1, cli_args.tokenize_workers)
     tokenize_log_interval = max(1, cli_args.tokenize_log_interval)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cli_args.lr)
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        print("loaded model/optimizer state from checkpoint", flush=True)
     model.train()
 
     log_interval = max(1, cli_args.log_interval)
-    global_step = 0
+    global_step = int(resume_ckpt.get("global_step", 0)) if resume_ckpt is not None else 0
+    last_epoch = int(resume_ckpt.get("epoch", 0)) if resume_ckpt is not None else 0
     try:
         for epoch in range(1, cli_args.epochs + 1):
+            last_epoch = epoch
             epoch_loss_sum = 0.0
             epoch_batches = 0
             epoch_samples = 0
@@ -533,7 +565,7 @@ def run_train(cli_args):
                     tokenizer,
                     src_texts,
                     tgt_texts,
-                    cli_args.block_size,
+                    train_block_size,
                     tokenize_batch_size=tokenize_batch_size,
                     tokenize_workers=tokenize_workers,
                     tokenize_log_interval=tokenize_log_interval,
@@ -615,11 +647,27 @@ def run_train(cli_args):
             f"\nTraining interrupted at step {global_step}. Saving checkpoint...",
             flush=True,
         )
-        save_checkpoint(cli_args.checkpoint, model, optimizer, model_args, tokenizer_name)
+        save_checkpoint(
+            cli_args.checkpoint,
+            model,
+            optimizer,
+            model_args,
+            tokenizer_name,
+            global_step=global_step,
+            epoch=last_epoch,
+        )
         print(f"checkpoint saved: {cli_args.checkpoint}", flush=True)
         return
 
-    save_checkpoint(cli_args.checkpoint, model, optimizer, model_args, tokenizer_name)
+    save_checkpoint(
+        cli_args.checkpoint,
+        model,
+        optimizer,
+        model_args,
+        tokenizer_name,
+        global_step=global_step,
+        epoch=last_epoch,
+    )
     print(f"checkpoint saved: {cli_args.checkpoint}")
 
 
