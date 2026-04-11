@@ -4,10 +4,12 @@ from torch import nn
 from dataclasses import asdict, dataclass
 import argparse
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoTokenizer
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 
 try:
     from datasets import load_dataset
@@ -20,7 +22,7 @@ class ModelArgs:
     n_heads: int
     dropout: float
     vocab_size: int
-    block_size: int
+    max_length: int
     n_layer: int
 '''
 shape is like [B, Tq, n_embd], consider [Tq, n_embd] below:  
@@ -89,7 +91,7 @@ class MultiHeadAttention(nn.Module):
     ):
         head_out = []
         for i in range(self.n_heads):
-            q_i = self.wq[i](q)   # (B, Tq, head_dim)
+            q_i = self.wq[i](q)   # res: (B, Tq, head_dim)
             k_i = self.wk[i](k)
             v_i = self.wv[i](v)
 
@@ -204,8 +206,8 @@ class Decoder(nn.Module):
 class PositionalEncoding(nn.Module):
     def __init__(self, args):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(args.block_size, args.n_embd)
-        position = torch.arange(0, args.block_size).unsqueeze(1)
+        pe = torch.zeros(args.max_length, args.n_embd)
+        position = torch.arange(0, args.max_length).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, args.n_embd, 2) * -(math.log(10000.0) / args.n_embd)
         )
@@ -223,7 +225,7 @@ class Transformer(nn.Module):
     def __init__(self, args):
         super().__init__()
         assert args.vocab_size is not None
-        assert args.block_size is not None
+        assert args.max_length is not None
         self.args = args
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(args.vocab_size, args.n_embd),
@@ -251,6 +253,19 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def encode(
+        self,
+        encoder_idx: torch.Tensor,
+        encoder_k_pad_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        _, src_t = encoder_idx.size()
+        assert src_t <= self.args.max_length, f"encoder length is {src_t}, max is {self.args.max_length}"
+
+        enc_tok_emb = self.transformer.wte(encoder_idx)
+        enc_pos_emb = self.transformer.wpe(enc_tok_emb)
+        enc_x = self.transformer.drop(enc_pos_emb)
+        return self.transformer.encoder(enc_x, encoder_k_pad_mask)
+
     def forward(
         self,
         encoder_idx,
@@ -260,19 +275,14 @@ class Transformer(nn.Module):
         encoder_k_pad_mask: torch.Tensor=None,
         decoder_k_pad_mask: torch.Tensor=None,
     ):
-        _, src_t = encoder_idx.size()
         _, tgt_t = decoder_idx.size()
-        assert src_t <= self.args.block_size, f"encoder length is {src_t}, max is {self.args.block_size}"
-        assert tgt_t <= self.args.block_size, f"decoder length is {tgt_t}, max is {self.args.block_size}"
+        assert tgt_t <= self.args.max_length, f"decoder length is {tgt_t}, max is {self.args.max_length}"
 
         if debug:
             print("encoder_idx", encoder_idx.size())
             print("decoder_idx", decoder_idx.size())
 
-        enc_tok_emb = self.transformer.wte(encoder_idx)
-        enc_pos_emb = self.transformer.wpe(enc_tok_emb)
-        enc_x = self.transformer.drop(enc_pos_emb)
-        enc_out = self.transformer.encoder(enc_x, encoder_k_pad_mask)
+        enc_out = self.encode(encoder_idx, encoder_k_pad_mask)
         if debug:
             print("enc_out:", enc_out.size())
 
@@ -298,80 +308,136 @@ class Transformer(nn.Module):
         return logits, loss
 
 
-def _tokenize_translation_batch(tokenizer, src_texts, tgt_texts, max_length):
-    src_encoded = tokenizer(
-        src_texts,
-        return_tensors="pt",
-        max_length=max_length,
-        truncation=True,
-        padding="max_length",
-    )
-    tgt_encoded = tokenizer(
-        tgt_texts,
-        return_tensors="pt",
-        max_length=max_length,
-        truncation=True,
-        padding="max_length",
-    )
-    return src_encoded.input_ids, tgt_encoded.input_ids
+class DataPipeline:
+    def __init__(self):
+        self._worker_state = threading.local()
 
-
-def build_translation_seq2seq_dataset(
-    tokenizer,
-    src_texts,
-    tgt_texts,
-    block_size,
-    tokenize_batch_size=20000,
-    tokenize_workers=16,
-    tokenize_log_interval=10,
-    progress_prefix="",
-):
-    if len(src_texts) != len(tgt_texts):
-        raise ValueError("Source and target sample counts do not match.")
-
-    tokenize_batch_size = max(1, tokenize_batch_size)
-    tokenize_log_interval = max(1, tokenize_log_interval)
-    progress_prefix = f"{progress_prefix} " if progress_prefix else ""
-    max_length = max(4, block_size)
-    sub_batches = [
-        (
-            src_texts[i : i + tokenize_batch_size],
-            tgt_texts[i : i + tokenize_batch_size],
+    def _tokenize_translation_batch(self, tokenizer, src_texts, tgt_texts, max_length):
+        src_encoded = tokenizer(
+            src_texts,
+            max_length=max_length,
+            truncation=True,
+            padding=False,
         )
-        for i in range(0, len(src_texts), tokenize_batch_size)
-    ]
-    if not sub_batches:
-        raise ValueError("No translation samples found in this chunk.")
-    total_tasks = len(sub_batches)
+        tgt_encoded = tokenizer(
+            tgt_texts,
+            max_length=max_length - 1,
+            truncation=True,
+            padding=False,
+            add_special_tokens=False,
+        )
+        return src_encoded.input_ids, tgt_encoded.input_ids
 
-    def maybe_print_tokenize_progress(done_tasks):
+    def _get_worker_tokenizer(self, tokenizer_name, tokenizer_use_fast):
+        worker_tokenizer = getattr(self._worker_state, "tokenizer", None)
+        cached_name = getattr(self._worker_state, "tokenizer_name", None)
+        cached_use_fast = getattr(self._worker_state, "tokenizer_use_fast", None)
         if (
-            done_tasks == 1
-            or done_tasks == total_tasks
-            or done_tasks % tokenize_log_interval == 0
+            worker_tokenizer is None
+            or cached_name != tokenizer_name
+            or cached_use_fast != tokenizer_use_fast
         ):
-            progress = (done_tasks / total_tasks) * 100
-            print(
-                f"{progress_prefix}tokenize task {done_tasks}/{total_tasks} ({progress:.1f}%)",
-                flush=True,
+            worker_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                use_fast=tokenizer_use_fast,
+                local_files_only=True,
             )
+            self._worker_state.tokenizer = worker_tokenizer
+            self._worker_state.tokenizer_name = tokenizer_name
+            self._worker_state.tokenizer_use_fast = tokenizer_use_fast
+        return worker_tokenizer
 
-    if tokenize_workers <= 1 or len(sub_batches) == 1:
-        src_parts = []
-        tgt_parts = []
-        for task_idx, (src_batch, tgt_batch) in enumerate(sub_batches, start=1):
-            src_ids, tgt_ids = _tokenize_translation_batch(
-                tokenizer, src_batch, tgt_batch, max_length
+    def _tokenize_sub_batch(
+        self,
+        tokenizer_name,
+        tokenizer_use_fast,
+        src_batch,
+        tgt_batch,
+        max_length,
+    ):
+        worker_tokenizer = self._get_worker_tokenizer(tokenizer_name, tokenizer_use_fast)
+        return self._tokenize_translation_batch(
+            worker_tokenizer,
+            src_batch,
+            tgt_batch,
+            max_length,
+        )
+
+    def pad_token_id(self, tokenizer):
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        return pad_token_id
+
+    def bos_token_id(self, tokenizer):
+        bos_token_id = tokenizer.bos_token_id
+        if bos_token_id is None:
+            bos_token_id = tokenizer.cls_token_id
+        if bos_token_id is None:
+            bos_token_id = tokenizer.sep_token_id
+        if bos_token_id is None:
+            bos_token_id = 0
+        return bos_token_id
+
+    def eos_token_id(self, tokenizer):
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = tokenizer.sep_token_id
+        return eos_token_id
+
+    def build_translation_seq2seq_dataset(
+        self,
+        tokenizer,
+        chunk_data,
+        max_length,
+        tokenize_batch_size=20000,
+        tokenize_workers=16,
+        tokenize_log_interval=10,
+        progress_prefix="",
+    ):
+        src_texts, tgt_texts = chunk_data
+        if len(src_texts) != len(tgt_texts):
+            raise ValueError("Source and target sample counts do not match.")
+
+        tokenize_batch_size = max(1, tokenize_batch_size)
+        tokenize_log_interval = max(1, tokenize_log_interval)
+        progress_prefix = f"{progress_prefix} " if progress_prefix else ""
+        max_length = max(4, max_length)
+        sub_batches = [
+            (
+                src_texts[i : i + tokenize_batch_size],
+                tgt_texts[i : i + tokenize_batch_size],
             )
-            src_parts.append(src_ids)
-            tgt_parts.append(tgt_ids)
-            maybe_print_tokenize_progress(task_idx)
-    else:
+            for i in range(0, len(src_texts), tokenize_batch_size)
+        ]
+        if not sub_batches:
+            raise ValueError("No translation samples found in this chunk.")
+        total_tasks = len(sub_batches)
+        tokenizer_name = tokenizer.name_or_path
+        tokenizer_use_fast = getattr(tokenizer, "is_fast", True)
+
+        def maybe_print_tokenize_progress(done_tasks):
+            if (
+                done_tasks == 1
+                or done_tasks == total_tasks
+                or done_tasks % tokenize_log_interval == 0
+            ):
+                progress = (done_tasks / total_tasks) * 100
+                print(
+                    f"{progress_prefix} chunk loaded progress {done_tasks}/{total_tasks} ({progress:.1f}%)",
+                    flush=True,
+                )
+
         max_workers = min(max(1, tokenize_workers), len(sub_batches))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    _tokenize_translation_batch, tokenizer, src_batch, tgt_batch, max_length
+                    self._tokenize_sub_batch,
+                    tokenizer_name,
+                    tokenizer_use_fast,
+                    src_batch,
+                    tgt_batch,
+                    max_length,
                 ): idx
                 for idx, (src_batch, tgt_batch) in enumerate(sub_batches)
             }
@@ -386,307 +452,380 @@ def build_translation_seq2seq_dataset(
                 done_tasks += 1
                 maybe_print_tokenize_progress(done_tasks)
 
-    encoder_tensor = torch.cat(src_parts, dim=0)
-    target_tokens = torch.cat(tgt_parts, dim=0)
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    bos_token_id = tokenizer.bos_token_id
-    if bos_token_id is None:
-        bos_token_id = tokenizer.cls_token_id
-    if bos_token_id is None:
-        bos_token_id = tokenizer.sep_token_id
-    if bos_token_id is None:
-        bos_token_id = pad_token_id
+        dataset = []
+        for src_batch_ids, tgt_batch_ids in zip(src_parts, tgt_parts):
+            dataset.extend(zip(src_batch_ids, tgt_batch_ids))
+        return dataset
 
-    decoder_tensor = torch.full_like(target_tokens, pad_token_id)
-    decoder_tensor[:, 0] = bos_token_id
-    decoder_tensor[:, 1:] = target_tokens[:, :-1]
-    labels = target_tokens.clone()
-    labels = labels.masked_fill(labels == pad_token_id, -100)
-    return TensorDataset(encoder_tensor, decoder_tensor, labels)
+    def collate_translation_batch(self, batch, tokenizer):
+        pad_token_id = self.pad_token_id(tokenizer)
+        bos_token_id = self.bos_token_id(tokenizer)
+        eos_token_id = self.eos_token_id(tokenizer)
 
+        batch_encoder_inputs = pad_sequence(
+            [torch.tensor(src_ids, dtype=torch.long) for src_ids, _ in batch],
+            batch_first=True,
+            padding_value=pad_token_id,
+        )
+        batch_decoder_inputs = pad_sequence(
+            [torch.tensor([bos_token_id, *tgt_ids], dtype=torch.long) for _, tgt_ids in batch],
+            batch_first=True,
+            padding_value=pad_token_id,
+        )
+        batch_targets = pad_sequence(
+            [torch.tensor([*tgt_ids, eos_token_id], dtype=torch.long) for _, tgt_ids in batch],
+            batch_first=True,
+            padding_value=-100,
+        )
+        return batch_encoder_inputs, batch_decoder_inputs, batch_targets
 
-def iter_hf_translation_chunks(
-    dataset_name,
-    dataset_config,
-    dataset_split,
-    src_lang,
-    tgt_lang,
-    chunk_lines,
-    max_samples=None,
-):
-    if load_dataset is None:
-        raise ImportError("datasets is not installed. Please run: pip install datasets")
+    def init_read_data_chunk_iter(
+        self,
+        dataset_name,
+        dataset_config,
+        dataset_split,
+        src_lang,
+        tgt_lang,
+        chunk_lines,
+        max_samples=None,
+    ):
+        if load_dataset is None:
+            raise ImportError("datasets is not installed. Please run: pip install datasets")
 
-    chunk_lines = max(1, chunk_lines)
-    dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
-    emitted = 0
-    src_chunk = []
-    tgt_chunk = []
-    for item in dataset:
-        pair = item.get("translation")
-        if not isinstance(pair, dict):
-            continue
-        src_text = pair.get(src_lang)
-        tgt_text = pair.get(tgt_lang)
-        if src_text is None or tgt_text is None:
-            continue
-        src_text = str(src_text).strip()
-        tgt_text = str(tgt_text).strip()
-        if not src_text or not tgt_text:
-            continue
-        src_chunk.append(src_text)
-        tgt_chunk.append(tgt_text)
-        emitted += 1
-        if len(src_chunk) >= chunk_lines:
+        chunk_lines = max(1, chunk_lines)
+        dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
+        emitted = 0
+        src_chunk = []
+        tgt_chunk = []
+        for item in dataset:
+            pair = item.get("translation")
+            if not isinstance(pair, dict):
+                continue
+            src_text = pair.get(src_lang)
+            tgt_text = pair.get(tgt_lang)
+            if src_text is None or tgt_text is None:
+                continue
+            src_text = str(src_text).strip()
+            tgt_text = str(tgt_text).strip()
+            if not src_text or not tgt_text:
+                continue
+            src_chunk.append(src_text)
+            tgt_chunk.append(tgt_text)
+            emitted += 1
+            if len(src_chunk) >= chunk_lines:
+                yield src_chunk, tgt_chunk
+                src_chunk = []
+                tgt_chunk = []
+            if max_samples is not None and emitted >= max_samples:
+                break
+
+        if src_chunk:
             yield src_chunk, tgt_chunk
-            src_chunk = []
-            tgt_chunk = []
-        if max_samples is not None and emitted >= max_samples:
-            break
 
-    if src_chunk:
-        yield src_chunk, tgt_chunk
+class TransformerCLI:
+    def __init__(self):
+        self.data_pipeline = DataPipeline()
+        self.resume_ckpt = None
+        self.infer_ckpt = None
+        self.runtime_device = None
+        self.tokenizer = None
+        self.pad_token_id = None
+        self.model_args = None
+        self.parse_cli_args()
+        self.init_runtime_state()
 
-
-def save_checkpoint(
-    path,
-    model,
-    optimizer,
-    model_args,
-    tokenizer_name,
-    global_step=None,
-    epoch=None,
-):
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "model_args": asdict(model_args),
-        "tokenizer_name": tokenizer_name,
-    }
-    if global_step is not None:
-        ckpt["global_step"] = int(global_step)
-    if epoch is not None:
-        ckpt["epoch"] = int(epoch)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(ckpt, path)
-
-
-def load_checkpoint(path, device):
-    ckpt = torch.load(path, map_location=device)
-    model_args = ModelArgs(**ckpt["model_args"])
-    tokenizer_name = ckpt.get("tokenizer_name", "bert-base-multilingual-cased")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    model = Transformer(model_args).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    return model, tokenizer
-
-
-@torch.no_grad()
-def generate_greedy(
-    model,
-    encoder_idx,
-    decoder_idx,
-    max_new_tokens,
-    eos_token_id=None,
-    encoder_k_pad_mask=None,
-):
-    model.eval()
-    for _ in range(max_new_tokens):
-        encoder_cond = encoder_idx[:, -model.args.block_size:]
-        decoder_cond = decoder_idx[:, -model.args.block_size:]
-        encoder_mask_cond = None
-        if encoder_k_pad_mask is not None:
-            encoder_mask_cond = encoder_k_pad_mask[:, -model.args.block_size:]
-        logits, _ = model(
-            encoder_cond,
-            decoder_cond,
-            encoder_k_pad_mask=encoder_mask_cond,
-        )
-        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-        decoder_idx = torch.cat([decoder_idx, next_token], dim=1)
-        if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
-            break
-    return decoder_idx
-
-
-def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Train and run a tiny Transformer demo.")
-    parser.add_argument("--mode", choices=["train", "infer"], default="train")
-    parser.add_argument("--checkpoint", type=str, default="transformer.pt")
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help="Resume training from a saved checkpoint path",
-    )
-    parser.add_argument("--tokenizer_name", type=str, default="bert-base-multilingual-cased")
-    parser.add_argument("--hf_dataset_name", type=str, default="wmt/wmt18")
-    parser.add_argument("--hf_dataset_config", type=str, default="zh-en")
-    parser.add_argument("--hf_dataset_split", type=str, default="train")
-    parser.add_argument("--src_lang", type=str, default="zh", help="Source language code")
-    parser.add_argument("--tgt_lang", type=str, default="en", help="Target language code")
-    parser.add_argument("--text", type=str, default="I love learning large language models.")
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--log_interval", type=int, default=100, help="Print train progress every N batches")
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=0,
-        help="Maximum number of training samples to read; 0 means no limit",
-    )
-    parser.add_argument(
-        "--chunk_lines",
-        type=int,
-        default=200000,
-        help="Number of translation pairs per chunk",
-    )
-    parser.add_argument(
-        "--tokenize_batch_size",
-        type=int,
-        default=2000,
-        help="Tokenization mini-batch size inside each chunk",
-    )
-    parser.add_argument(
-        "--tokenize_workers",
-        type=int,
-        default=16,
-        help="Number of parallel tokenization threads per chunk (1 disables parallelism)",
-    )
-    parser.add_argument(
-        "--tokenize_log_interval",
-        type=int,
-        default=10,
-        help="Print tokenization progress every N tokenization tasks",
-    )
-    parser.add_argument("--block_size", type=int, default=128)
-    parser.add_argument("--max_new_tokens", type=int, default=20)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser.parse_args()
-
-
-def run_train(cli_args):
-    device = torch.device(cli_args.device)
-    resume_ckpt = None
-    tokenizer_name = cli_args.tokenizer_name
-    if cli_args.resume_from_checkpoint is not None:
-        resume_ckpt = torch.load(cli_args.resume_from_checkpoint, map_location=device)
-        tokenizer_name = resume_ckpt.get("tokenizer_name", tokenizer_name)
-        print(f"resuming from checkpoint: {cli_args.resume_from_checkpoint}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    if resume_ckpt is not None and "model_args" in resume_ckpt:
-        model_args = ModelArgs(**resume_ckpt["model_args"])
-    else:
-        model_args = ModelArgs(
-            n_embd=512,
-            n_heads=8,
-            dropout=0.1,
-            vocab_size=tokenizer.vocab_size,
-            block_size=cli_args.block_size,
-            n_layer=6,
-        )
-    if model_args.vocab_size != tokenizer.vocab_size:
-        raise ValueError(
-            f"Tokenizer vocab_size ({tokenizer.vocab_size}) does not match model vocab_size ({model_args.vocab_size})."
-        )
-    if model_args.block_size != cli_args.block_size:
-        print(
-            f"using block_size from model/checkpoint: {model_args.block_size} "
-            f"(ignoring cli --block_size={cli_args.block_size})",
-            flush=True,
-        )
-    train_block_size = model_args.block_size
-    model = Transformer(model_args).to(device)
-    chunk_lines = max(1, cli_args.chunk_lines)
-    max_samples = None if cli_args.max_samples == 0 else max(1, cli_args.max_samples)
-    tokenize_batch_size = max(1, cli_args.tokenize_batch_size)
-    tokenize_workers = max(1, cli_args.tokenize_workers)
-    tokenize_log_interval = max(1, cli_args.tokenize_log_interval)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cli_args.lr)
-    if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state_dict"])
-        if "optimizer_state_dict" in resume_ckpt:
-            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        print("loaded model/optimizer state from checkpoint", flush=True)
-    model.train()
-
-    log_interval = max(1, cli_args.log_interval)
-    global_step = int(resume_ckpt.get("global_step", 0)) if resume_ckpt is not None else 0
-    last_epoch = int(resume_ckpt.get("epoch", 0)) if resume_ckpt is not None else 0
-    try:
-        for epoch in range(1, cli_args.epochs + 1):
-            last_epoch = epoch
-            epoch_loss_sum = 0.0
-            epoch_batches = 0
-            epoch_samples = 0
-            epoch_chunks = 0
+    def apply_checkpoint_tokenizer_name(self, ckpt, checkpoint_path):
+        checkpoint_tokenizer_name = ckpt.get("tokenizer_name")
+        if checkpoint_tokenizer_name is None:
+            return
+        if checkpoint_tokenizer_name != self.tokenizer_name:
             print(
-                f"epoch {epoch}/{cli_args.epochs} loading HF dataset "
-                f"{cli_args.hf_dataset_name} ({cli_args.hf_dataset_config}) "
-                f"split={cli_args.hf_dataset_split} {cli_args.src_lang}->{cli_args.tgt_lang}",
+                f"using tokenizer_name from checkpoint {checkpoint_path}: {checkpoint_tokenizer_name} "
+                f"(overriding cli --tokenizer_name={self.tokenizer_name})",
                 flush=True,
             )
-            chunk_iter = iter_hf_translation_chunks(
-                cli_args.hf_dataset_name,
-                cli_args.hf_dataset_config,
-                cli_args.hf_dataset_split,
-                cli_args.src_lang,
-                cli_args.tgt_lang,
-                chunk_lines,
-                max_samples=max_samples,
+        self.tokenizer_name = checkpoint_tokenizer_name
+
+    def init_runtime_state(self):
+        self.runtime_device = torch.device(self.device)
+        if self.mode == "train" and self.resume_from_checkpoint is not None:
+            self.resume_ckpt = torch.load(self.resume_from_checkpoint, map_location=self.runtime_device)
+            self.apply_checkpoint_tokenizer_name(self.resume_ckpt, self.resume_from_checkpoint)
+            print(f"resuming from checkpoint: {self.resume_from_checkpoint}", flush=True)
+        if self.mode == "infer":
+            self.infer_ckpt = torch.load(self.checkpoint, map_location=self.runtime_device)
+            self.apply_checkpoint_tokenizer_name(self.infer_ckpt, self.checkpoint)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
+        self.pad_token_id = self.data_pipeline.pad_token_id(self.tokenizer)
+        if self.mode == "train":
+            self.model_args = self.init_model_args()
+
+    def init_model_args(self):
+        if self.resume_ckpt is not None and "model_args" in self.resume_ckpt:
+            model_args = ModelArgs(**self.resume_ckpt["model_args"])
+        else:
+            model_args = ModelArgs(
+                n_embd=512,
+                n_heads=8,
+                dropout=0.1,
+                vocab_size=self.tokenizer.vocab_size,
+                max_length=self.max_length,
+                n_layer=6,
             )
-            first_chunk_data = next(chunk_iter, None)
-            if first_chunk_data is None:
-                raise ValueError("No translation samples found in the HF dataset.")
+        if model_args.vocab_size != self.tokenizer.vocab_size:
+            raise ValueError(
+                f"Tokenizer vocab_size ({self.tokenizer.vocab_size}) does not match model vocab_size ({model_args.vocab_size})."
+            )
+        if model_args.max_length != self.max_length:
+            print(
+                f"using max_length from model/checkpoint: {model_args.max_length} "
+                f"(ignoring cli --max_length={self.max_length})",
+                flush=True,
+            )
+        return model_args
 
-            def submit_chunk_dataset(prefetch_executor, chunk_data, chunk_idx):
-                src_texts, tgt_texts = chunk_data
-                return prefetch_executor.submit(
-                    build_translation_seq2seq_dataset,
-                    tokenizer,
-                    src_texts,
-                    tgt_texts,
-                    train_block_size,
-                    tokenize_batch_size=tokenize_batch_size,
-                    tokenize_workers=tokenize_workers,
-                    tokenize_log_interval=tokenize_log_interval,
-                    progress_prefix=f"epoch {epoch}/{cli_args.epochs} chunk {chunk_idx}",
+    def save_checkpoint(
+        self,
+        path,
+        model,
+        model_args,
+    ):
+        ckpt = {
+            "model_state_dict": model.state_dict(),
+            "model_args": asdict(model_args),
+            "tokenizer_name": self.tokenizer_name,
+        }
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(ckpt, path)
+
+    def load_checkpoint(self, path, device, ckpt=None):
+        if ckpt is None:
+            ckpt = torch.load(path, map_location=device)
+        model_args = ModelArgs(**ckpt["model_args"])
+        model = Transformer(model_args).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        return model
+
+    @torch.no_grad()
+    def generate_greedy(
+        self,
+        model,
+        encoder_idx,
+        decoder_idx,
+        max_new_tokens,
+        eos_token_id=None,
+        encoder_k_pad_mask=None,
+    ):
+        model.eval()
+        for _ in range(max_new_tokens):
+            encoder_cond = encoder_idx[:, -model.args.max_length:]
+            decoder_cond = decoder_idx[:, -model.args.max_length:]
+            encoder_mask_cond = None
+            if encoder_k_pad_mask is not None:
+                encoder_mask_cond = encoder_k_pad_mask[:, -model.args.max_length:]
+            logits, _ = model(
+                encoder_cond,
+                decoder_cond,
+                encoder_k_pad_mask=encoder_mask_cond,
+            )
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            decoder_idx = torch.cat([decoder_idx, next_token], dim=1)
+            if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
+                break
+        return decoder_idx
+
+    @torch.no_grad()
+    def print_encoder_out_diagnostics(self, model, encoder_idx, encoder_k_pad_mask):
+        encoder_out = model.encode(encoder_idx, encoder_k_pad_mask)
+        valid_token_count = int((~encoder_k_pad_mask[0]).sum().item())
+        print("encoder_out shape:", tuple(encoder_out.shape))
+        print("encoder_out valid tokens:", valid_token_count)
+        if valid_token_count > 0:
+            valid_encoder_out = encoder_out[0, :valid_token_count].detach().cpu()
+            print("encoder_out stats:", {
+                "mean": float(valid_encoder_out.mean().item()),
+                "std": float(valid_encoder_out.std().item()),
+                "min": float(valid_encoder_out.min().item()),
+                "max": float(valid_encoder_out.max().item()),
+            })
+            print(
+                "encoder_out per_token_std:",
+                valid_encoder_out.std(dim=-1, unbiased=False),
+            )
+            if valid_token_count > 1:
+                print(
+                    "encoder_out adjacent cosine_similarity:",
+                    F.cosine_similarity(
+                        valid_encoder_out[:-1],
+                        valid_encoder_out[1:],
+                        dim=-1,
+                    ),
+                )
+                print(
+                    "encoder_out adjacent l2_diff:",
+                    torch.norm(
+                        valid_encoder_out[1:] - valid_encoder_out[:-1],
+                        dim=-1,
+                    ),
+                )
+            else:
+                print("encoder_out adjacent comparisons: skipped, only one valid token")
+            print("encoder_out:", valid_encoder_out)
+        else:
+            print("encoder_out stats: skipped, no valid encoder tokens")
+
+    def parse_cli_args(self):
+        parser = argparse.ArgumentParser(description="Train and run a tiny Transformer demo.")
+        parser.add_argument("--mode", choices=["train", "infer"], default="train")
+        parser.add_argument("--checkpoint", type=str, default="transformer.pt")
+        parser.add_argument(
+            "--resume_from_checkpoint",
+            type=str,
+            default=None,
+            help="Resume training from a saved checkpoint path",
+        )
+        parser.add_argument("--tokenizer_name", type=str, default="bert-base-multilingual-cased")
+        parser.add_argument("--hf_dataset_name", type=str, default="wmt/wmt18")
+        parser.add_argument("--hf_dataset_config", type=str, default="zh-en")
+        parser.add_argument("--hf_dataset_split", type=str, default="train")
+        parser.add_argument("--src_lang", type=str, default="zh", help="Source language code")
+        parser.add_argument("--tgt_lang", type=str, default="en", help="Target language code")
+        parser.add_argument("--text", type=str, default="I love learning large language models.")
+        parser.add_argument("--epochs", type=int, default=8)
+        parser.add_argument("--batch_size", type=int, default=16)
+        parser.add_argument(
+            "--optimizer",
+            choices=["adam", "adamw"],
+            default="adam",
+            help="Training optimizer; default is Adam to avoid decoupled weight decay shrinking LayerNorm params",
+        )
+        parser.add_argument("--lr", type=float, default=3e-4)
+        parser.add_argument("--log_interval", type=int, default=100, help="Print train progress every N batches")
+        parser.add_argument(
+            "--max_samples",
+            type=int,
+            default=0,
+            help="Maximum number of training samples to read; 0 means no limit",
+        )
+        parser.add_argument(
+            "--chunk_lines",
+            type=int,
+            default=200000,
+            help="Number of translation pairs per chunk",
+        )
+        parser.add_argument(
+            "--tokenize_batch_size",
+            type=int,
+            default=2000,
+            help="Tokenization mini-batch size inside each chunk",
+        )
+        parser.add_argument(
+            "--tokenize_workers",
+            type=int,
+            default=16,
+            help="Number of parallel tokenization threads per chunk (1 disables parallelism)",
+        )
+        parser.add_argument(
+            "--tokenize_log_interval",
+            type=int,
+            default=10,
+            help="Print tokenization progress every N tokenization tasks",
+        )
+        parser.add_argument("--max_length", type=int, default=128)
+        parser.add_argument("--max_new_tokens", type=int, default=20)
+        parser.add_argument(
+            "--print_encoder_out",
+            action="store_true",
+            help="Print encoder output once before greedy decoding during inference",
+        )
+        parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+        cli_args = parser.parse_args()
+        self.cli_args = cli_args
+        for key, value in vars(cli_args).items():
+            setattr(self, key, value)
+
+    def build_optimizer(self, model):
+        if self.optimizer == "adam":
+            print(f"using optimizer: Adam lr={self.lr}", flush=True)
+            return torch.optim.Adam(model.parameters(), lr=self.lr)
+        # AdamW applies decoupled weight decay to all parameters here, including
+        # LayerNorm weights, which can undesirably shrink LayerNorm scales. 
+        # And will cause encoder collapse
+        print(f"using optimizer: AdamW lr={self.lr}", flush=True)
+        return torch.optim.AdamW(model.parameters(), lr=self.lr)
+
+    def run_train(self):
+        device = self.runtime_device
+        tokenizer = self.tokenizer
+        pad_token_id = self.pad_token_id
+        model_args = self.model_args
+        train_max_length = model_args.max_length
+        model = Transformer(model_args).to(device)
+        if self.resume_ckpt is not None:
+            model.load_state_dict(self.resume_ckpt["model_state_dict"])
+            print("loaded model state from checkpoint", flush=True)
+        chunk_lines = max(1, self.chunk_lines)
+        max_samples = None if self.max_samples == 0 else max(1, self.max_samples)
+        tokenize_batch_size = max(1, self.tokenize_batch_size)
+        tokenize_workers = max(1, self.tokenize_workers)
+        tokenize_log_interval = max(1, self.tokenize_log_interval)
+        optimizer = self.build_optimizer(model)
+        model.train()
+        def collate_translation_batch(batch):
+            return self.data_pipeline.collate_translation_batch(batch, tokenizer)
+
+        log_interval = max(1, self.log_interval)
+        global_step = 0
+        try:
+            for epoch in range(1, self.epochs + 1):
+                epoch_loss_sum = 0.0
+                epoch_batches = 0
+                epoch_chunks = 0
+                print(
+                    f"epoch {epoch}/{self.epochs} loading HF dataset "
+                    f"{self.hf_dataset_name} ({self.hf_dataset_config}) "
+                    f"split={self.hf_dataset_split} {self.src_lang}->{self.tgt_lang}",
+                    flush=True,
+                )
+                data_chunk_iter = self.data_pipeline.init_read_data_chunk_iter(
+                    self.hf_dataset_name,
+                    self.hf_dataset_config,
+                    self.hf_dataset_split,
+                    self.src_lang,
+                    self.tgt_lang,
+                    chunk_lines,
+                    max_samples=max_samples,
                 )
 
-            def chunk_size(chunk_data):
-                src_texts, _ = chunk_data
-                return len(src_texts)
+                def next_chunk_dataset(chunk_idx):
+                    chunk_data = next(data_chunk_iter, None)
+                    if chunk_data is None:
+                        return None
+                    dataset = self.data_pipeline.build_translation_seq2seq_dataset(
+                        tokenizer,
+                        chunk_data,
+                        train_max_length,
+                        tokenize_batch_size=tokenize_batch_size,
+                        tokenize_workers=tokenize_workers,
+                        tokenize_log_interval=tokenize_log_interval,
+                        progress_prefix=f"epoch {epoch}/{self.epochs} chunk {chunk_idx}",
+                    )
+                    return dataset
 
-            with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
-                current_chunk_idx = 1
-                current_chunk_data = first_chunk_data
-                current_dataset_future = submit_chunk_dataset(
-                    prefetch_executor, current_chunk_data, current_chunk_idx
-                )
-
-                while current_dataset_future is not None:
-                    dataset = current_dataset_future.result()
-
-                    next_chunk_data = next(chunk_iter, None)
-                    if next_chunk_data is not None:
-                        next_chunk_idx = current_chunk_idx + 1
-                        next_dataset_future = submit_chunk_dataset(
-                            prefetch_executor, next_chunk_data, next_chunk_idx
-                        )
-                    else:
-                        next_dataset_future = None
-
-                    epoch_chunks = current_chunk_idx
-                    epoch_samples += chunk_size(current_chunk_data)
-                    dataloader = DataLoader(dataset, batch_size=cli_args.batch_size, shuffle=True)
+                chunk_idx = 1
+                while (dataset := next_chunk_dataset(chunk_idx)) is not None:
+                    epoch_chunks = chunk_idx
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=self.batch_size,
+                        shuffle=True,
+                        collate_fn=collate_translation_batch,
+                    )
                     total_batches = len(dataloader)
                     print(
-                        f"epoch {epoch}/{cli_args.epochs} "
-                        f"chunk {current_chunk_idx} loaded {chunk_size(current_chunk_data)} samples "
-                        f"(epoch_samples={epoch_samples})",
+                        f"epoch {epoch}/{self.epochs} "
+                        f"chunk {chunk_idx} loaded successfully ",
                         flush=True,
                     )
 
@@ -696,13 +835,19 @@ def run_train(cli_args):
                         batch_targets = batch_targets.to(device)
                         batch_encoder_k_pad_mask = batch_encoder_inputs.eq(pad_token_id)
                         batch_decoder_k_pad_mask = batch_decoder_inputs.eq(pad_token_id)
-                        _, loss = model(
+                        logits, next_token_loss = model(
                             batch_encoder_inputs,
                             batch_decoder_inputs,
                             batch_targets,
                             encoder_k_pad_mask=batch_encoder_k_pad_mask,
                             decoder_k_pad_mask=batch_decoder_k_pad_mask,
                         )
+                        first_token_loss = F.cross_entropy(
+                            logits[:, 0, :].detach(),
+                            batch_targets[:, 0],
+                            ignore_index=-100,
+                        )
+                        loss = next_token_loss
                         optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -715,95 +860,76 @@ def run_train(cli_args):
                             epoch_avg_so_far = epoch_loss_sum / epoch_batches
                             chunk_progress = (batch_idx / max(total_batches, 1)) * 100
                             print(
-                                f"epoch {epoch}/{cli_args.epochs} "
-                                f"chunk {current_chunk_idx} batch {batch_idx}/{total_batches} ({chunk_progress:.1f}%) "
+                                f"epoch {epoch}/{self.epochs} "
+                                f"chunk {chunk_idx} batch {batch_idx}/{total_batches} ({chunk_progress:.1f}%) "
                                 f"step {global_step} "
-                                f"loss={loss.item():.4f} avg_loss={epoch_avg_so_far:.4f}",
+                                f"loss={loss.item():.4f} "
+                                f"next_loss={next_token_loss.item():.4f} "
+                                f"first_loss={first_token_loss.item():.4f} "
+                                f"avg_loss={epoch_avg_so_far:.4f}",
                                 flush=True,
                             )
+                    chunk_idx = chunk_idx + 1
 
-                    current_chunk_idx += 1
-                    current_chunk_data = next_chunk_data
-                    current_dataset_future = next_dataset_future
-
-            if epoch_batches == 0:
-                raise ValueError("No training samples were produced from the HF dataset.")
-            epoch_avg_loss = epoch_loss_sum / epoch_batches
+                if epoch_batches == 0:
+                    raise ValueError("No training samples were produced from the HF dataset.")
+                epoch_avg_loss = epoch_loss_sum / epoch_batches
+                print(
+                    f"epoch {epoch}/{self.epochs} avg_loss={epoch_avg_loss:.4f} "
+                    f"chunks={epoch_chunks}",
+                    flush=True,
+                )
+        except KeyboardInterrupt:
             print(
-                f"epoch {epoch}/{cli_args.epochs} avg_loss={epoch_avg_loss:.4f} "
-                f"samples={epoch_samples} chunks={epoch_chunks}",
+                f"\nTraining interrupted at step {global_step}. Saving checkpoint...",
                 flush=True,
             )
-    except KeyboardInterrupt:
-        print(
-            f"\nTraining interrupted at step {global_step}. Saving checkpoint...",
-            flush=True,
-        )
-        save_checkpoint(
-            cli_args.checkpoint,
+            return
+        except Exception as e:
+            print(f"training failed: {e}", flush=True)
+            raise
+        finally:
+            self.save_checkpoint(
+                self.checkpoint,
+                model,
+                model_args,
+            )
+            print(f"checkpoint saved: {self.checkpoint}", flush=True)
+
+    def run_infer(self):
+        device = self.runtime_device
+        model = self.load_checkpoint(self.checkpoint, device, ckpt=self.infer_ckpt)
+        tokenizer = self.tokenizer
+        pad_token_id = self.pad_token_id
+        encoder_idx = tokenizer(
+            self.text,
+            return_tensors="pt",
+            max_length=model.args.max_length,
+            truncation=True,
+        ).input_ids.to(device)
+        encoder_k_pad_mask = encoder_idx.eq(pad_token_id)
+        if self.print_encoder_out:
+            self.print_encoder_out_diagnostics(model, encoder_idx, encoder_k_pad_mask)
+        bos_token_id = self.data_pipeline.bos_token_id(tokenizer)
+        eos_token_id = self.data_pipeline.eos_token_id(tokenizer)
+        decoder_start = torch.full((1, 1), bos_token_id, dtype=torch.long, device=device)
+        generated_decoder = self.generate_greedy(
             model,
-            optimizer,
-            model_args,
-            tokenizer_name,
-            global_step=global_step,
-            epoch=last_epoch,
+            encoder_idx,
+            decoder_start,
+            self.max_new_tokens,
+            eos_token_id=eos_token_id,
+            encoder_k_pad_mask=encoder_k_pad_mask,
         )
-        print(f"checkpoint saved: {cli_args.checkpoint}", flush=True)
-        return
+        print(tokenizer.decode(generated_decoder[0, 1:], skip_special_tokens=True))
 
-    save_checkpoint(
-        cli_args.checkpoint,
-        model,
-        optimizer,
-        model_args,
-        tokenizer_name,
-        global_step=global_step,
-        epoch=last_epoch,
-    )
-    print(f"checkpoint saved: {cli_args.checkpoint}")
-
-
-def run_infer(cli_args):
-    device = torch.device(cli_args.device)
-    model, tokenizer = load_checkpoint(cli_args.checkpoint, device)
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    encoder_idx = tokenizer(
-        cli_args.text,
-        return_tensors="pt",
-        max_length=model.args.block_size,
-        truncation=True,
-        padding="max_length",
-    ).input_ids.to(device)
-    encoder_k_pad_mask = encoder_idx.eq(pad_token_id)
-    bos_token_id = tokenizer.bos_token_id
-    if bos_token_id is None:
-        bos_token_id = tokenizer.cls_token_id
-    if bos_token_id is None:
-        bos_token_id = tokenizer.sep_token_id
-    if bos_token_id is None:
-        bos_token_id = tokenizer.pad_token_id
-    if bos_token_id is None:
-        bos_token_id = 0
-    decoder_start = torch.full((1, 1), bos_token_id, dtype=torch.long, device=device)
-    generated_decoder = generate_greedy(
-        model,
-        encoder_idx,
-        decoder_start,
-        cli_args.max_new_tokens,
-        eos_token_id=tokenizer.sep_token_id,
-        encoder_k_pad_mask=encoder_k_pad_mask,
-    )
-    print(tokenizer.decode(generated_decoder[0, 1:], skip_special_tokens=True))
-
-
-def main():
-    cli_args = parse_cli_args()
-    if cli_args.mode == "train":
-        run_train(cli_args)
-    else:
-        run_infer(cli_args)
+    def main(self):
+        if self.mode == "train":
+            self.run_train()
+        else:
+            self.run_infer()
 
 
 if __name__ == "__main__":
     print("start")
-    main()
+    TransformerCLI().main()
