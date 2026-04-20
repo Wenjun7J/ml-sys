@@ -487,17 +487,25 @@ class DataPipeline:
         src_lang,
         tgt_lang,
         chunk_lines,
+        data_offset=0,
         max_samples=None,
+        shuffle_dataset=False,
+        shuffle_seed=42,
     ):
         if load_dataset is None:
             raise ImportError("datasets is not installed. Please run: pip install datasets")
 
         chunk_lines = max(1, chunk_lines)
+        data_offset = max(0, data_offset)
         dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
+        if shuffle_dataset:
+            dataset = dataset.shuffle(seed=shuffle_seed)
         emitted = 0
         src_chunk = []
         tgt_chunk = []
-        for item in dataset:
+        for row_idx, item in enumerate(dataset):
+            if row_idx < data_offset:
+                continue
             pair = item.get("translation")
             if not isinstance(pair, dict):
                 continue
@@ -715,6 +723,23 @@ class TransformerCLI:
             help="Number of translation pairs per chunk",
         )
         parser.add_argument(
+            "--data_offset",
+            type=int,
+            default=0,
+            help="Number of dataset rows to skip before reading training data",
+        )
+        parser.add_argument(
+            "--shuffle_dataset",
+            action="store_true",
+            help="Globally shuffle the HF dataset before splitting it into chunks",
+        )
+        parser.add_argument(
+            "--shuffle_seed",
+            type=int,
+            default=42,
+            help="Base random seed for global dataset shuffle; each epoch adds epoch - 1",
+        )
+        parser.add_argument(
             "--tokenize_batch_size",
             type=int,
             default=2000,
@@ -766,6 +791,7 @@ class TransformerCLI:
             model.load_state_dict(self.resume_ckpt["model_state_dict"])
             print("loaded model state from checkpoint", flush=True)
         chunk_lines = max(1, self.chunk_lines)
+        data_offset = max(0, self.data_offset)
         max_samples = None if self.max_samples == 0 else max(1, self.max_samples)
         tokenize_batch_size = max(1, self.tokenize_batch_size)
         tokenize_workers = max(1, self.tokenize_workers)
@@ -785,7 +811,9 @@ class TransformerCLI:
                 print(
                     f"epoch {epoch}/{self.epochs} loading HF dataset "
                     f"{self.hf_dataset_name} ({self.hf_dataset_config}) "
-                    f"split={self.hf_dataset_split} {self.src_lang}->{self.tgt_lang}",
+                    f"split={self.hf_dataset_split} offset={data_offset} "
+                    f"{self.src_lang}->{self.tgt_lang} "
+                    f"shuffle={self.shuffle_dataset} seed={self.shuffle_seed + epoch - 1}",
                     flush=True,
                 )
                 data_chunk_iter = self.data_pipeline.init_read_data_chunk_iter(
@@ -795,7 +823,10 @@ class TransformerCLI:
                     self.src_lang,
                     self.tgt_lang,
                     chunk_lines,
+                    data_offset=data_offset,
                     max_samples=max_samples,
+                    shuffle_dataset=self.shuffle_dataset,
+                    shuffle_seed=self.shuffle_seed + epoch - 1,
                 )
 
                 def next_chunk_dataset(chunk_idx):
