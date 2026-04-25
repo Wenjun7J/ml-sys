@@ -4,7 +4,7 @@ Machine learning systems experiments and small model implementations.
 
 The current repository focuses on a six-layer encoder-decoder Transformer
 inspired by "Attention Is All You Need". It trains on Hugging Face translation
-data, saves PyTorch checkpoints, and runs greedy decoding for inference. The
+data [wmt18](https://huggingface.co/datasets/wmt/wmt18), saves PyTorch checkpoints, and runs greedy decoding for inference. The
 default setup targets `zh -> en` translation with a multilingual BERT
 tokenizer.
 
