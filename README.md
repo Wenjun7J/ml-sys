@@ -80,6 +80,18 @@ python models/transformer/transformer.py \
   --text "我喜欢学习大语言模型。"
 ```
 
+Run inference with beam search:
+
+```bash
+python models/transformer/transformer.py \
+  --mode infer \
+  --checkpoint transformer.pt \
+  --device cuda \
+  --text "我喜欢学习大语言模型。" \
+  --decode_strategy beam \
+  --beam_size 4
+```
+
 ### Defaults
 
 Training defaults:
@@ -127,7 +139,10 @@ Inference defaults:
 | --- | --- | --- |
 | `--text` | `I love learning large language models.` | Override this for the source language used during training. |
 | `--max_new_tokens` | `20` | Maximum number of generated decoder tokens. |
-| `--print_encoder_out` | disabled | Prints encoder tensor diagnostics before greedy decoding. |
+| `--decode_strategy` | `greedy` | Use `beam` to enable beam search decoding. |
+| `--beam_size` | `4` | Number of beams kept when `--decode_strategy beam` is used. |
+| `--beam_length_penalty` | `0.0` | Length penalty exponent for beam ranking; `0.0` disables length normalization. |
+| `--print_encoder_out` | disabled | Prints encoder tensor diagnostics before decoding. |
 
 ### Training Behavior
 
@@ -175,14 +190,15 @@ used.
 
 ### Inference
 
-Inference loads `--checkpoint`, tokenizes `--text`, and decodes greedily from a
-single BOS token until EOS or `--max_new_tokens`.
+Inference loads `--checkpoint`, tokenizes `--text`, and decodes from a single
+BOS token until EOS or `--max_new_tokens`. Greedy decoding is the default; pass
+`--decode_strategy beam` to use beam search.
 
 The default training direction is `zh -> en`, so use Chinese source text for
 checkpoints trained with the default dataset and language settings.
 
 ### Known Limitations
 
-- Greedy decoding only; no beam search or sampling.
+- No sampling decoder.
 - No validation loop, metrics, or checkpoint selection.
 - Resume restores weights only, not optimizer or dataloader state.

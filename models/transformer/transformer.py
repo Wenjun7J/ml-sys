@@ -643,6 +643,97 @@ class TransformerCLI:
                 break
         return decoder_idx
 
+    def _beam_rank_score(self, log_prob, generated_len, length_penalty):
+        if length_penalty <= 0:
+            return log_prob
+        return log_prob / (max(1, generated_len) ** length_penalty)
+
+    @torch.no_grad()
+    def generate_beam_search(
+        self,
+        model,
+        encoder_idx,
+        decoder_idx,
+        max_new_tokens,
+        beam_size,
+        eos_token_id=None,
+        encoder_k_pad_mask=None,
+        length_penalty=0.0,
+    ):
+        if encoder_idx.size(0) != 1 or decoder_idx.size(0) != 1:
+            raise ValueError("beam search inference currently supports batch size 1")
+
+        model.eval()
+        start_len = decoder_idx.size(1)
+        beams = [
+            {
+                "tokens": decoder_idx,
+                "log_prob": 0.0,
+                "done": False,
+            }
+        ]
+
+        for _ in range(max_new_tokens):
+            candidates = [beam for beam in beams if beam["done"]]
+            active_beams = [beam for beam in beams if not beam["done"]]
+            if not active_beams:
+                break
+
+            active_decoder_idx = torch.cat([beam["tokens"] for beam in active_beams], dim=0)
+            active_count = active_decoder_idx.size(0)
+            encoder_cond = encoder_idx[:, -model.args.max_length:].expand(active_count, -1)
+            decoder_cond = active_decoder_idx[:, -model.args.max_length:]
+            encoder_mask_cond = None
+            if encoder_k_pad_mask is not None:
+                encoder_mask_cond = encoder_k_pad_mask[:, -model.args.max_length:].expand(active_count, -1)
+
+            logits, _ = model(
+                encoder_cond,
+                decoder_cond,
+                encoder_k_pad_mask=encoder_mask_cond,
+            )
+            log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+            top_log_probs, top_token_ids = torch.topk(
+                log_probs,
+                k=min(beam_size, log_probs.size(-1)),
+                dim=-1,
+            )
+
+            for beam_idx, beam in enumerate(active_beams):
+                for token_rank in range(top_token_ids.size(1)):
+                    next_token = top_token_ids[beam_idx, token_rank].view(1, 1)
+                    next_tokens = torch.cat([beam["tokens"], next_token], dim=1)
+                    next_log_prob = beam["log_prob"] + float(top_log_probs[beam_idx, token_rank].item())
+                    candidates.append(
+                        {
+                            "tokens": next_tokens,
+                            "log_prob": next_log_prob,
+                            "done": eos_token_id is not None and int(next_token.item()) == eos_token_id,
+                        }
+                    )
+
+            candidates.sort(
+                key=lambda beam: self._beam_rank_score(
+                    beam["log_prob"],
+                    beam["tokens"].size(1) - start_len,
+                    length_penalty,
+                ),
+                reverse=True,
+            )
+            beams = candidates[:beam_size]
+            if all(beam["done"] for beam in beams):
+                break
+
+        best_beam = max(
+            beams,
+            key=lambda beam: self._beam_rank_score(
+                beam["log_prob"],
+                beam["tokens"].size(1) - start_len,
+                length_penalty,
+            ),
+        )
+        return best_beam["tokens"]
+
     @torch.no_grad()
     def print_encoder_out_diagnostics(self, model, encoder_idx, encoder_k_pad_mask):
         encoder_out = model.encode(encoder_idx, encoder_k_pad_mask)
@@ -760,12 +851,34 @@ class TransformerCLI:
         parser.add_argument("--max_length", type=int, default=128)
         parser.add_argument("--max_new_tokens", type=int, default=20)
         parser.add_argument(
+            "--decode_strategy",
+            choices=["greedy", "beam"],
+            default="greedy",
+            help="Decoder search strategy used during inference",
+        )
+        parser.add_argument(
+            "--beam_size",
+            type=int,
+            default=4,
+            help="Number of beams to keep when --decode_strategy beam is used",
+        )
+        parser.add_argument(
+            "--beam_length_penalty",
+            type=float,
+            default=0.0,
+            help="Length penalty exponent for beam ranking; 0 disables length normalization",
+        )
+        parser.add_argument(
             "--print_encoder_out",
             action="store_true",
-            help="Print encoder output once before greedy decoding during inference",
+            help="Print encoder output once before decoding during inference",
         )
         parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
         cli_args = parser.parse_args()
+        if cli_args.beam_size < 1:
+            parser.error("--beam_size must be >= 1")
+        if cli_args.beam_length_penalty < 0:
+            parser.error("--beam_length_penalty must be >= 0")
         self.cli_args = cli_args
         for key, value in vars(cli_args).items():
             setattr(self, key, value)
@@ -944,14 +1057,26 @@ class TransformerCLI:
         bos_token_id = self.data_pipeline.bos_token_id(tokenizer)
         eos_token_id = self.data_pipeline.eos_token_id(tokenizer)
         decoder_start = torch.full((1, 1), bos_token_id, dtype=torch.long, device=device)
-        generated_decoder = self.generate_greedy(
-            model,
-            encoder_idx,
-            decoder_start,
-            self.max_new_tokens,
-            eos_token_id=eos_token_id,
-            encoder_k_pad_mask=encoder_k_pad_mask,
-        )
+        if self.decode_strategy == "greedy":
+            generated_decoder = self.generate_greedy(
+                model,
+                encoder_idx,
+                decoder_start,
+                self.max_new_tokens,
+                eos_token_id=eos_token_id,
+                encoder_k_pad_mask=encoder_k_pad_mask,
+            )
+        else:
+            generated_decoder = self.generate_beam_search(
+                model,
+                encoder_idx,
+                decoder_start,
+                self.max_new_tokens,
+                self.beam_size,
+                eos_token_id=eos_token_id,
+                encoder_k_pad_mask=encoder_k_pad_mask,
+                length_penalty=self.beam_length_penalty,
+            )
         print(tokenizer.decode(generated_decoder[0, 1:], skip_special_tokens=True))
 
     def main(self):
