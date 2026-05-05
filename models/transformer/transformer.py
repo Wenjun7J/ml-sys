@@ -615,6 +615,32 @@ class TransformerCLI:
         model.eval()
         return model
 
+    def _decode_next_logits(
+        self,
+        model,
+        encoder_idx,
+        decoder_idx,
+        encoder_k_pad_mask=None,
+    ):
+        active_count = decoder_idx.size(0)
+        encoder_cond = encoder_idx[:, -model.args.max_length:]
+        if encoder_cond.size(0) != active_count:
+            encoder_cond = encoder_cond.expand(active_count, -1)
+
+        decoder_cond = decoder_idx[:, -model.args.max_length:]
+        encoder_mask_cond = None
+        if encoder_k_pad_mask is not None:
+            encoder_mask_cond = encoder_k_pad_mask[:, -model.args.max_length:]
+            if encoder_mask_cond.size(0) != active_count:
+                encoder_mask_cond = encoder_mask_cond.expand(active_count, -1)
+
+        logits, _ = model(
+            encoder_cond,
+            decoder_cond,
+            encoder_k_pad_mask=encoder_mask_cond,
+        )
+        return logits[:, -1, :]
+
     @torch.no_grad()
     def generate_greedy(
         self,
@@ -627,17 +653,13 @@ class TransformerCLI:
     ):
         model.eval()
         for _ in range(max_new_tokens):
-            encoder_cond = encoder_idx[:, -model.args.max_length:]
-            decoder_cond = decoder_idx[:, -model.args.max_length:]
-            encoder_mask_cond = None
-            if encoder_k_pad_mask is not None:
-                encoder_mask_cond = encoder_k_pad_mask[:, -model.args.max_length:]
-            logits, _ = model(
-                encoder_cond,
-                decoder_cond,
-                encoder_k_pad_mask=encoder_mask_cond,
+            next_logits = self._decode_next_logits(
+                model,
+                encoder_idx,
+                decoder_idx,
+                encoder_k_pad_mask=encoder_k_pad_mask,
             )
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
             decoder_idx = torch.cat([decoder_idx, next_token], dim=1)
             if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
                 break
@@ -680,19 +702,13 @@ class TransformerCLI:
                 break
 
             active_decoder_idx = torch.cat([beam["tokens"] for beam in active_beams], dim=0)
-            active_count = active_decoder_idx.size(0)
-            encoder_cond = encoder_idx[:, -model.args.max_length:].expand(active_count, -1)
-            decoder_cond = active_decoder_idx[:, -model.args.max_length:]
-            encoder_mask_cond = None
-            if encoder_k_pad_mask is not None:
-                encoder_mask_cond = encoder_k_pad_mask[:, -model.args.max_length:].expand(active_count, -1)
-
-            logits, _ = model(
-                encoder_cond,
-                decoder_cond,
-                encoder_k_pad_mask=encoder_mask_cond,
+            next_logits = self._decode_next_logits(
+                model,
+                encoder_idx,
+                active_decoder_idx,
+                encoder_k_pad_mask=encoder_k_pad_mask,
             )
-            log_probs = F.log_softmax(logits[:, -1, :], dim=-1)
+            log_probs = F.log_softmax(next_logits, dim=-1)
             top_log_probs, top_token_ids = torch.topk(
                 log_probs,
                 k=min(beam_size, log_probs.size(-1)),
